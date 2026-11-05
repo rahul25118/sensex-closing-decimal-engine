@@ -1,5 +1,5 @@
 """
-SENSEX 3:25 PM HARD-LOCK DECIMAL ENGINE
+SENSEX 3:25 PM HARD-LOCK DECIMAL ENGINE (NATIVE)
 - Locks permanently at exactly 15:25:00 IST on trading days.
 - M1: 15:00-15:25 Cumulative VWAP (+/- 7 = 15 candidates)
 - M3: 15:25 Cutoff Price Band (+/- 17 = 35 candidates)
@@ -13,7 +13,7 @@ import yfinance as yf
 import pytz
 from datetime import datetime
 import plotly.express as px
-from streamlit_autorefresh import st_autorefresh
+import time
 
 # -------------------------------------------------------------
 # PAGE CONFIGURATION
@@ -28,15 +28,21 @@ st.set_page_config(
 IST = pytz.timezone("Asia/Kolkata")
 now_ist = datetime.now(IST)
 
-# -------------------------------------------------------------
-# AUTO-REFRESH CONTROLLER
-# -------------------------------------------------------------
-# यदि 3:25 PM से पहले का समय है, तो हर 10 सेकंड में ऑटो-रिफ्रेश होगा
+# Native HTML/JS Auto-refresh (हर 10 सेकंड में रिफ्रेश, बिना किसी बाहरी लाइब्रेरी के)
 is_market_day = now_ist.weekday() < 5
 is_before_325 = (now_ist.hour < 15) or (now_ist.hour == 15 and now_ist.minute < 25)
 
 if is_market_day and is_before_325:
-    st_autorefresh(interval=10000, key="live_data_ticker")
+    st.markdown(
+        """
+        <script>
+            setTimeout(function(){
+               window.location.reload();
+            }, 10000);
+        </script>
+        """,
+        unsafe_allow_html=True
+    )
 
 # -------------------------------------------------------------
 # DATA ENGINE WITH HARD 15:25 FILTER
@@ -72,7 +78,6 @@ def fetch_and_calculate():
         if df_locked.empty:
             df_locked = df
 
-        # 15:25 या उपलब्ध अंतिम बार
         bar_cutoff = df_locked.iloc[-1]
         p_cutoff = float(bar_cutoff["Close"])
         dec_cutoff = extract_dec(p_cutoff)
@@ -106,7 +111,6 @@ def fetch_and_calculate():
             "prime_core": prime_core,
             "basket_m1": basket_m1,
             "basket_m3": basket_m3,
-            "status": "LOCKED" if not is_before_325 else "LIVE_PENDING"
         }, "OK"
 
     except Exception as e:
@@ -129,7 +133,6 @@ is_locked = not is_before_325
 if is_locked:
     st.success(f"🔒 **3:25 PM कट-ऑफ बास्केट पूरी तरह लॉक हो चुकी है!** (अंतिम टिक समय: {data['cutoff_timestamp'].strftime('%H:%M:%S')})")
 else:
-    remaining_min = 25 - now_ist.minute if now_ist.hour == 15 else 60
     st.warning(f"⏳ **लाइव मॉनिटरिंग चालू है:** 3:25 PM कट-ऑफ का इंतज़ार... (हर 10s में ऑटो-अपडेट)")
 
 # Top Metric Cards
