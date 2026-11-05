@@ -13,16 +13,23 @@ st.set_page_config(
 
 IST = pytz.timezone("Asia/Kolkata")
 
+# कस्टम स्टाइलिंग
 st.markdown("""
 <style>
-    .lock-banner {
+    .trade-banner {
         background-color: #d4edda;
         border: 2px solid #28a745;
         border-radius: 10px;
-        padding: 14px 20px;
+        padding: 16px 20px;
         color: #155724;
-        font-size: 18px;
-        font-weight: bold;
+        margin-bottom: 20px;
+    }
+    .skip-banner {
+        background-color: #f8d7da;
+        border: 2px solid #dc3545;
+        border-radius: 10px;
+        padding: 16px 20px;
+        color: #721c24;
         margin-bottom: 20px;
     }
     .waiting-banner {
@@ -82,10 +89,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("🏛️ BSE Sensex Pre-Close Decimal Engine")
-st.caption("30-मिनट VWAP मैकेनिज्म | लॉक समय: 03:20 PM IST (T-10 Min Lock) | 6 Low + 9 High बारबेल बास्केट")
+st.caption("30-मिनट VWAP मैकेनिज्म | T-10 Min Lock (03:20 PM IST) | 6 Low + 9 High बारबेल बास्केट + रिस्क गेट")
 
 @st.cache_data(ttl=60)
-def fetch_bse_clean_data():
+def fetch_bse_data():
     ticker = yf.Ticker("^BSESN")
     df = ticker.history(period="60d", interval="2m")
     if df.empty or len(df) < 30:
@@ -93,7 +100,6 @@ def fetch_bse_clean_data():
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC").tz_convert("Asia/Kolkata")
     else:
@@ -101,15 +107,12 @@ def fetch_bse_clean_data():
 
     df["Date"] = df.index.date
     df["Decimal"] = df["Close"].apply(lambda x: f"{float(x):.2f}".split(".")[1].zfill(2))
+    df["DayName"] = df.index.day_name()
 
     df_daily = ticker.history(period="60d", interval="1d")
     if isinstance(df_daily.columns, pd.MultiIndex):
         df_daily.columns = df_daily.columns.get_level_values(0)
-
-    daily_closes = {
-        d.date(): (row["Close"], f"{float(row['Close']):.2f}".split(".")[1].zfill(2))
-        for d, row in df_daily.iterrows()
-    }
+    daily_closes = {d.date(): (row["Close"], f"{float(row['Close']):.2f}".split(".")[1].zfill(2)) for d, row in df_daily.iterrows()}
 
     return df, daily_closes
 
@@ -125,6 +128,13 @@ def run_sensex_engine(day_df, official_tuple, low_k=6, high_k=9):
     if df_pre.empty:
         return None
 
+    day_name = day_df.iloc[0]["DayName"]
+
+    # गेट चेक्स
+    # 1. रेंज चेक (03:00 - 03:20 PM)
+    late_range = float(win_late["Close"].max() - win_late["Close"].min()) if len(win_late) > 0 else 0.0
+
+    # 2. रिपीटर्स डेंसिटी (02:00 - 03:20 PM)
     all_day_counts = Counter(df_pre["Decimal"])
     core_counts = Counter(win_core["Decimal"])
     late_counts = Counter(win_late["Decimal"])
@@ -134,8 +144,30 @@ def run_sensex_engine(day_df, official_tuple, low_k=6, high_k=9):
     confirmed = [k for k in uniques if all_day_counts.get(k, 0) >= 3]
     late_u = [k for k, v in late_counts.items() if v == 1]
 
-    pool = list(dict.fromkeys(repeaters + confirmed + late_u))
+    # ट्रेड पात्रता नियम
+    is_day_good = day_name in ["Tuesday", "Friday"]
+    is_day_medium = day_name == "Monday"
+    is_day_bad = day_name in ["Wednesday", "Thursday"]
 
+    is_range_ok = late_range <= 120.0
+    is_reps_ok = len(repeaters) >= 5
+
+    # अंतिम निर्णय
+    if is_day_bad:
+        decision = "SKIP"
+        reason = f"आज {day_name} है (इंटर-इंडेक्स एक्सपायरी नॉइज़ - ऐतिहासिक स्ट्राइक रेट ~15%)।"
+    elif not is_range_ok:
+        decision = "SKIP"
+        reason = f"अंतिम 20-मिनट रेंज {late_range:.1f} pt है (>120 pt लिमिट)। मोमेंटम स्पाइक जोखिम।"
+    elif not is_reps_ok:
+        decision = "SKIP"
+        reason = f"कोर रिपीटर्स केवल {len(repeaters)} हैं (<5 न्यूनतम)। लिक्विडिटी बिखरी हुई है।"
+    else:
+        decision = "TRADE"
+        conf = "उच्च (HIGH)" if is_day_good else "मध्यम (MODERATE)"
+        reason = f"{day_name} सेटअप | रेंज: {late_range:.1f} pt (शांत) | रिपीटर्स: {len(repeaters)} | कॉन्फिडेंस: {conf}"
+
+    pool = list(dict.fromkeys(repeaters + confirmed + late_u))
     if len(pool) < 15:
         for d in df_pre["Decimal"].tolist()[::-1]:
             if d not in pool:
@@ -174,11 +206,16 @@ def run_sensex_engine(day_df, official_tuple, low_k=6, high_k=9):
         "final_15": final_15,
         "is_hit": is_hit,
         "is_closed": is_market_closed,
-        "side": side
+        "side": side,
+        "decision": decision,
+        "reason": reason,
+        "day_name": day_name,
+        "late_range": late_range,
+        "reps_count": len(repeaters)
     }
 
 now_ist = datetime.now(IST)
-df_bse, daily_dict = fetch_bse_clean_data()
+df_bse, daily_dict = fetch_bse_data()
 
 if not df_bse.empty:
     bse_dates = sorted(df_bse["Date"].unique(), reverse=True)
@@ -197,12 +234,29 @@ if not df_bse.empty:
     )
 
     if res:
-        if selected_date == now_ist.date() and now_ist.time() < time(15, 20):
-            st.markdown('<div class="waiting-banner">⏳ लाइव मार्केट जारी है। ठीक 03:20 PM IST पर 15-नंबर बास्केट लॉक होगी।</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="lock-banner">🔒 03:20 PM IST पर लॉक की गई 15 बास्केट (6 Low + 9 High)</div>', unsafe_allow_html=True)
+        is_today = (selected_date == now_ist.date())
+        is_prelock = is_today and (now_ist.time() < time(15, 20))
 
-        st.subheader("🎯 15 उम्मीदवारों की मुख्य बास्केट (BSE Sensex)")
+        if is_prelock:
+            st.markdown('<div class="waiting-banner">⏳ लाइव मार्केट जारी है। ठीक 03:20 PM IST पर गेट और 15-नंबर बास्केट लॉक होगी।</div>', unsafe_allow_html=True)
+        else:
+            # निर्णय गेट बैनर
+            if res["decision"] == "TRADE":
+                st.markdown(f'''
+                <div class="trade-banner">
+                    <h3 style="margin:0; color:#155724;">🟢 SYSTEM ALERT: TRADE ELIGIBLE (सक्रिय दिन)</h3>
+                    <p style="margin:5px 0 0 0; font-size:16px;"><b>समीक्षा:</b> {res['reason']}</p>
+                </div>
+                ''', unsafe_allow_html=True)
+            else:
+                st.markdown(f'''
+                <div class="skip-banner">
+                    <h3 style="margin:0; color:#721c24;">🔴 SYSTEM ALERT: NO-TRADE DAY (स्किप करें)</h3>
+                    <p style="margin:5px 0 0 0; font-size:16px;"><b>चेतावनी:</b> {res['reason']}</p>
+                </div>
+                ''', unsafe_allow_html=True)
+
+        st.subheader("🎯 15 उम्मीदवारों की मुख्य बास्केट (6 Low + 9 High)")
         badges = "".join([
             f"<span class='badge-hit'>🎯 .{x} (HIT)</span>" if (res['is_closed'] and x == res['actual_dec'])
             else f"<span class='badge-main'>.{x}</span>"
@@ -219,13 +273,14 @@ if not df_bse.empty:
             st.markdown("".join([f"<span class='badge-high'>.{x}</span>" for x in res['highest']]), unsafe_allow_html=True)
 
         st.divider()
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("03:20 PM लॉक भाव", f"{res['price_at_lock']:.2f}")
+        m2.metric("20-Min रेंज (03:00-03:20)", f"{res['late_range']:.1f} pts")
         if res["is_closed"]:
-            m2.metric("03:30 PM आधिकारिक क्लोज", f"{res['actual_price']:.2f} (.{res['actual_dec']})")
-            m3.metric("परिणाम", "✅ HIT" if res["is_hit"] else "❌ MISS", res["side"])
+            m3.metric("03:30 PM क्लोज", f"{res['actual_price']:.2f} (.{res['actual_dec']})")
+            m4.metric("परिणाम", "✅ HIT" if res["is_hit"] else "❌ MISS", res["side"])
         else:
-            m2.metric("03:30 PM क्लोज भाव", "ऑक्शन में...")
-            m3.metric("परिणाम", "प्रतीक्षा में")
+            m3.metric("03:30 PM क्लोज", "गणना जारी...")
+            m4.metric("स्थिति", "प्रतीक्षा में")
 else:
     st.error("BSE Sensex का डेटा फेच नहीं हो सका।")
